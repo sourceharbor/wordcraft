@@ -275,14 +275,42 @@ fn cell_clip(clips: &Clips, story: StoryRef, path: &[u32]) -> Option<Rect> {
 /// The text boxes among `items` whose text is warped (Text Effects › Transform, drawn bent): their
 /// story, frame and warp. Empty, without a walk of the document, when none is.
 fn warped_boxes(doc: &Document, items: &[Placed]) -> Vec<(u32, Rect, wordcraft_doc::wordart::TextWarp)> {
+    // Keep only requested offsets. A page may show a few boxes from a much longer paragraph,
+    // and several placements may share an offset or a text-box story.
+    let mut needed: HashMap<_, HashMap<_, Option<&wordcraft_doc::wordart::TextWarp>>> = HashMap::new();
+    for it in items {
+        crate::work::steps(1);
+        if let Placed::Object { story, path, off, text_box: Some(_), .. } = it {
+            needed.entry((*story, path)).or_default().insert(*off, None);
+        }
+    }
+    for ((story, path), offsets) in &mut needed {
+        let Some(p) = doc.para(*story, path) else { continue };
+        offsets.retain(|off, _| p.text.get(*off..).is_some_and(|tail| tail.starts_with(wordcraft_doc::para::OBJ)));
+        let Some(last) = offsets.keys().max().copied() else { continue };
+        // Stop at the last requested byte offset, including when it precedes a long run of
+        // ordinary text. Pair markers and objects exactly as Paragraph::objects_with_offsets.
+        let markers = p
+            .text
+            .char_indices()
+            .take_while(|(off, _)| *off <= last)
+            .inspect(|_| crate::work::steps(1))
+            .filter(|(_, c)| *c == wordcraft_doc::para::OBJ);
+        for ((off, _), object) in markers.zip(&p.objects) {
+            if let Some(warp) = offsets.get_mut(&off)
+                && let InlineObject::Shape { extra, .. } = object
+            {
+                *warp = extra.warp.as_ref().filter(|w| !w.is_plain());
+            }
+        }
+    }
     items
         .iter()
         .filter_map(|it| {
+            crate::work::steps(1);
             let Placed::Object { rect, story, path, off, text_box: Some(id), .. } = it else { return None };
-            match doc.para(*story, path)?.object_at(*off)? {
-                InlineObject::Shape { extra, .. } => extra.warp.clone().filter(|w| !w.is_plain()).map(|w| (*id, *rect, w)),
-                _ => None,
-            }
+            let warp = needed.get(&(*story, path))?.get(off)?.as_ref()?;
+            Some((*id, *rect, (*warp).clone()))
         })
         .collect()
 }
@@ -554,5 +582,176 @@ mod tests_clips {
             let hits = (0..cells.len() as u32).filter(|r| cell_clip(&clips, StoryRef::Body, &[0, *r, 0, 0]).is_some()).count();
             assert_eq!(hits, cells.len());
         });
+    }
+}
+
+#[cfg(test)]
+mod tests_warp_lookups {
+    use super::*;
+    use wordcraft_doc::para::{OBJ, ShapeKind};
+    use wordcraft_doc::wordart::TextWarp;
+    use wordcraft_doc::{Block, CharProps, Paragraph, Path};
+
+    fn shape(warp: Option<TextWarp>) -> InlineObject {
+        InlineObject::Shape {
+            kind: ShapeKind::Rectangle,
+            w: 100.0,
+            h: 30.0,
+            fill: None,
+            stroke: None,
+            stroke_width: 0.0,
+            float: Default::default(),
+            story: Some(7),
+            freeform: None,
+            effects: Default::default(),
+            extra: wordcraft_doc::connector::ShapeExtra { warp, ..Default::default() },
+        }
+    }
+
+    fn placed(story: StoryRef, path: Path, off: usize, id: Option<u32>) -> Placed {
+        Placed::Object {
+            rect: Rect::new(off as f32, 2.0, 100.0, 30.0),
+            spin: Default::default(),
+            story,
+            path,
+            off,
+            text_box: id,
+            wrap: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
+    #[test]
+    fn text_box_warp_lookups_preserve_item_order_and_missing_objects() {
+        let arch = TextWarp::new("textArchUp").unwrap();
+        let wave = TextWarp::new("textWave1").unwrap();
+        let objects = vec![
+            InlineObject::BookmarkStart { name: "original".into() },
+            shape(None),
+            shape(TextWarp::new("textPlain")),
+            shape(Some(arch.clone())),
+            InlineObject::FieldEnd,
+            shape(Some(wave.clone())),
+        ];
+        let mut p = Paragraph::new();
+        p.text = format!("é{}λ", OBJ.to_string().repeat(objects.len() + 1));
+        p.runs = vec![wordcraft_doc::para::Run { len: p.text.len(), props: CharProps::default() }];
+        p.objects = objects;
+        let mut d = Document::from_text("");
+        d.body = vec![Block::Para(p).into()];
+        let item = |index, id| placed(StoryRef::Body, Path::top(0), 2 + index * OBJ.len_utf8(), id);
+        let items = vec![
+            item(5, Some(11)),
+            item(0, Some(8)),
+            item(1, Some(9)),
+            item(2, Some(10)),
+            item(3, Some(11)),
+            item(3, Some(12)),
+            item(5, None),
+            item(6, Some(13)),
+            placed(StoryRef::Body, Path::top(0), 3, Some(14)),
+            placed(StoryRef::Body, Path::top(0), 0, Some(14)),
+            placed(StoryRef::Body, Path::top(1), 2, Some(14)),
+            placed(StoryRef::Part(7), Path::top(0), 2, Some(14)),
+        ];
+        let got = warped_boxes(&d, &items);
+        assert_eq!(
+            got,
+            vec![
+                (11, Rect::new(17.0, 2.0, 100.0, 30.0), wave),
+                (11, Rect::new(11.0, 2.0, 100.0, 30.0), arch.clone()),
+                (12, Rect::new(11.0, 2.0, 100.0, 30.0), arch)
+            ]
+        );
+        // Extra stored objects without a matching marker are not addressable.
+        let p = d.para_mut(StoryRef::Body, &Path::top(0)).unwrap();
+        p.text.truncate(2 + 4 * OBJ.len_utf8());
+        assert_eq!(warped_boxes(&d, &items), got[1..]);
+        assert!(warped_boxes(&d, &[]).is_empty());
+    }
+
+    #[test]
+    fn text_box_warp_lookups_keep_paragraph_and_story_keys_separate() {
+        let presets = ["textArchUp", "textWave1", "textArchDown", "textSlantUp"];
+        let para = |preset| {
+            let mut p = Paragraph::new();
+            p.text = OBJ.to_string();
+            p.runs = vec![wordcraft_doc::para::Run { len: p.text.len(), props: CharProps::default() }];
+            p.objects = vec![shape(TextWarp::new(preset))];
+            p
+        };
+        let mut d = Document::from_text("");
+        d.body = vec![Block::Para(para(presets[0])).into(), Block::Para(para(presets[1])).into()];
+        let mut table = wordcraft_doc::Table::new(1, 1, 100.0);
+        table.rows[0].cells[0].blocks = vec![Block::Para(para(presets[2])).into()];
+        d.body.push(Block::Table(table).into());
+        let id = d.add_part(wordcraft_doc::PartKind::Header, vec![Block::Para(para(presets[3])).into()]);
+        let items = vec![
+            placed(StoryRef::Body, Path::top(0), 0, Some(1)),
+            placed(StoryRef::Body, Path::top(1), 0, Some(1)),
+            placed(StoryRef::Body, Path(vec![2, 0, 0, 0]), 0, Some(1)),
+            placed(StoryRef::Part(id), Path::top(0), 0, Some(1)),
+        ];
+        assert_eq!(warped_boxes(&d, &items), presets.map(|p| (1, Rect::new(0.0, 2.0, 100.0, 30.0), TextWarp::new(p).unwrap())));
+    }
+
+    /// #3614: deciding whether text boxes have a warp is part of every page repaint, including
+    /// pages whose boxes are all plain. The steps (items looked at and paragraph characters
+    /// walked, `crate::work`), not a timing: 8x the boxes must cost about 8x the steps, where a
+    /// rescan of the paragraph prefix for every box would cost about 64x.
+    #[test]
+    fn text_box_warp_lookups_do_not_rescan_the_paragraph_prefix() {
+        let make = |n: usize| {
+            let mut objects = Vec::new();
+            let mut items = Vec::new();
+            for i in 0..n {
+                objects.extend((0..16).map(|_| InlineObject::BookmarkEnd { name: "padding".into() }));
+                items.push(placed(StoryRef::Body, Path::top(0), objects.len() * OBJ.len_utf8(), Some(i as u32)));
+                objects.push(shape(None));
+            }
+            let mut p = Paragraph::new();
+            p.text = OBJ.to_string().repeat(objects.len());
+            p.runs = vec![wordcraft_doc::para::Run { len: p.text.len(), props: CharProps::default() }];
+            p.objects = objects;
+            let mut d = Document::from_text("");
+            d.body = vec![Block::Para(p).into()];
+            (d, items)
+        };
+        let (small, big) = (make(500), make(500 * crate::tests::SCALE));
+        let scan = |(doc, items): &(Document, Vec<Placed>)| crate::work::count(|| assert!(std::hint::black_box(warped_boxes(doc, items)).is_empty()));
+        let (s, b) = (scan(&small), scan(&big));
+        let ratio = b as f64 / s.max(1) as f64;
+        eprintln!("text-box warp discovery steps: {s} -> {b}, {ratio:.1}x for 8x boxes");
+        assert!(s > 0, "no steps counted, so the walk this test watches no longer counts them (crate::work)");
+        assert!(ratio <= 1.5 * crate::tests::SCALE as f64, "text-box warp discovery rescanned paragraph prefixes: {ratio:.1}x ({s} -> {b} steps)");
+    }
+
+    /// #3614: an invalid request must not extend the prefix walk into unrelated trailing text.
+    #[test]
+    fn text_box_warp_lookups_stop_at_the_last_valid_requested_offset() {
+        let make = |suffix: usize| {
+            let mut p = Paragraph::new();
+            p.text = format!("{OBJ}{}", "x".repeat(suffix));
+            p.runs = vec![wordcraft_doc::para::Run { len: p.text.len(), props: CharProps::default() }];
+            p.objects = vec![shape(TextWarp::new("textArchUp"))];
+            let mut d = Document::from_text("");
+            d.body = vec![Block::Para(p).into()];
+            d
+        };
+        let (short, long) = (make(0), make(1_000_000));
+        let items = vec![
+            placed(StoryRef::Body, Path::top(0), 0, Some(7)),
+            placed(StoryRef::Body, Path::top(0), usize::MAX, Some(8)),
+            placed(StoryRef::Body, Path::top(0), 1, Some(9)),
+            placed(StoryRef::Body, Path::top(0), OBJ.len_utf8(), Some(10)),
+        ];
+        let expected = vec![(7, Rect::new(0.0, 2.0, 100.0, 30.0), TextWarp::new("textArchUp").unwrap())];
+        assert_eq!(warped_boxes(&short, &items), expected);
+        assert_eq!(warped_boxes(&long, &items), expected);
+        let steps = |doc: &Document| crate::work::count(|| drop(std::hint::black_box(warped_boxes(doc, &items))));
+        let (s, l) = (steps(&short), steps(&long));
+        eprintln!("text-box warp suffix steps: {s} -> {l} with one million trailing bytes");
+        assert!(s > 0, "no steps counted, so the walk this test watches no longer counts them (crate::work)");
+        assert_eq!(s, l, "text-box warp lookup walked the trailing text: {s} -> {l} steps");
     }
 }
